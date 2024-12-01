@@ -7,8 +7,8 @@ except ImportError:
 
 MQTT_CONFIG = {
     "client_id": b'controller',
-    "server": "8.tcp.ngrok.io",
-    "port": 13164,
+    "server": "2.tcp.ngrok.io",
+    "port": 13514,
     "user": b"ground_station_admin",
     "password": b"ground_station_admin_password",
     "keepalive": 0,

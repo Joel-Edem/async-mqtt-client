@@ -1,7 +1,7 @@
 # Author: Joel Ametepeh
 # Date: 2024-11-21
 # Description: Fast Async Mqtt Client for python / micropython.
-# This implementation airms to reduce memory allocaitons and footprint.
+# This implementation aims to reduce memory allocations and footprint.
 #
 #
 # Copyright 2024 Joel Ametepeh <JoelAmetepeh@gmail.com>
@@ -20,7 +20,7 @@
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 # EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 # MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 # LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
@@ -42,7 +42,7 @@ class AsyncMQTTClient:
         self._pid = 0
         self._pid_gen = self._gen_pid()
         self._a_sock = False
-        self._temp_buf = bytearray(128)
+        self._temp_buf = bytearray(len(recv_buf) * 2)
         self._recv_buf = recv_buf
         self._meta = memoryview(bytearray(2))
         self._msg_recv = False
@@ -132,7 +132,7 @@ class AsyncMQTTClient:
         resp = await self.sock.a_read(4) if self._a_sock else self.sock.read(4)
         assert resp[0] == 0x20 and resp[1] == 0x02
         print("connected to mqtt")
-        return resp[2] & 1
+        return (resp[2] & 1) == 0
 
     async def disconnect(self):
         await self.sock.a_write(b"\xe0\0") if self._a_sock else self.sock.write(b"\xe0\0")
@@ -195,7 +195,7 @@ class AsyncMQTTClient:
             await uasyncio.sleep_ms(0)
 
     async def wait_msg(self):
-        res = await self.sock.a_read(1) if self._a_sock else self.sock.a_read(1)
+        res = await self.sock.a_read(1) if self._a_sock else self.sock.read(1)
         self.sock.setblocking(True)
         if res is None:
             return None
@@ -230,8 +230,8 @@ class AsyncMQTTClient:
             sz)
 
         # self.cb(memoryview(self._recv_buf)[:topic_len], memoryview(self._recv_buf)[topic_len:topic_len + sz])
-        self._meta[0:1] = topic_len
-        self._meta[1:2] = topic_len + sz
+        self._meta[0] = topic_len
+        self._meta[1] = topic_len + sz
         self._msg_recv = True
         if op & 6 == 2:
             pkt = bytearray(b"\x40\x02\0\0")
@@ -258,7 +258,6 @@ class AsyncMQTTClient:
     def msg(self):
         if self._msg_recv:
             return memoryview(self._recv_buf)[self._meta[0]:self._meta[1]]
-        return
 
     @property
     def topic(self):
