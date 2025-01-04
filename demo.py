@@ -1,14 +1,22 @@
+import socket
+
 from async_mqtt_client import AsyncMQTTClient
 
 try:
+    import micropython
     import uasyncio
-except ImportError:
+    client_name = b'mp_client'
+    sub_topic = b'py_client'
+except ImportError as e:
     import asyncio as uasyncio
+    client_name = b'py_client'
+    sub_topic = b'mp_client'
+
 
 MQTT_CONFIG = {
-    "client_id": b'controller',
-    "server": "2.tcp.ngrok.io",
-    "port": 13514,
+    "client_id": client_name,
+    "server": '192.168.100.228',
+    "port": 1883,
     "user": b"ground_station_admin",
     "password": b"ground_station_admin_password",
     "keepalive": 0,
@@ -38,9 +46,9 @@ async def connect():
     wlan.active(True)
     if not wlan.isconnected():
         print('connecting to network...')
-        wlan.connect('Rontelhome', 'sharon1991')
+        wlan.connect('ssid', 'password')
         while not wlan.isconnected():
-            await uasyncio.sleep_ms(1000)
+            await uasyncio.sleep(1)
     print('network config:', wlan.ifconfig())
     print("connected to wifi")
 
@@ -48,30 +56,31 @@ async def connect():
 async def demo():
     await connect()
 
-    recv_buf = bytearray(128)
-    client = AsyncMQTTClient(MQTT_CONFIG, memoryview(recv_buf))
-    try:
-        await client.connect(sock_cls=None, async_sock=False)
-    except Exception as e:
-        print(f"ERROR: could not connect to MQTT client.\n{e}")
-        return
-    topic = b"%s_commands" % MQTT_CONFIG['client_id']
-    await client.subscribe(topic)
-    try:
-        while 1:
-            await client.publish(topic, b'hello world')
+    recv_buf = bytearray(512)
 
-            if await client.check_msg():
-                print_buf(client.topic)
-                print_buf(client.msg)
-                client.mark_read()
-            await uasyncio.sleep_ms(0)
-    except KeyboardInterrupt:
-        print("stopped")
+    client = AsyncMQTTClient(MQTT_CONFIG, memoryview(recv_buf), socket, False)
+    try:
+        await client.connect()
+    except Exception as _e:
+        print(f"ERROR: could not connect to MQTT client.\n{_e}")
+        return
+    topic = client_name
+    await client.subscribe(sub_topic)
+    idx = 0
+    while 1:
+        await client.publish(topic, b'hello world from %s %i' % (client_name, idx))
+        idx += 1
+        if await client.check_msg():
+            print_buf(client.topic)
+            print_buf(client.msg)
+            client.mark_read()
+        await uasyncio.sleep(1)
 
 
 if __name__ == "__main__":
     try:
         uasyncio.run(demo())
+    except KeyboardInterrupt:
+        print("stopped")
     finally:
         uasyncio.new_event_loop()

@@ -1,30 +1,3 @@
-# Author: Joel Ametepeh
-# Date: 2024-11-21
-# Description: Fast Async Mqtt Client for python / micropython.
-# This implementation aims to reduce memory allocations and footprint.
-#
-#
-# Copyright 2024 Joel Ametepeh <JoelAmetepeh@gmail.com>
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-# NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
-# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
 try:
     import uasyncio
     import ustruct as struct
@@ -33,17 +6,108 @@ except ImportError:
     import asyncio as uasyncio
 
 
+def _is_mp() -> bool:
+    try:
+        import micropython
+        return True
+    except ImportError:
+        return False
+
+
+class WrappedSocket:
+
+    def __init__(self, sock, sock_cls, async_sock: bool):
+        self._sock = sock
+        self._sock_cls = sock_cls
+        self._async_sock = async_sock
+        self._is_mp = _is_mp()
+
+        if async_sock:
+            self.write = self._a_write
+        elif self._is_mp:
+            self.write = self._mp_write
+        else:
+            self.write = self._py_write
+
+        if self._async_sock:
+            self.read = self._a_read
+        elif self._is_mp:
+            self.read = self._mp_read
+        else:
+            self.read = self._py_read
+
+        if self._async_sock:
+            self.readinto = self._a_readinto
+        elif self._is_mp:
+            self.readinto = self._mp_readinto
+        else:
+            self.readinto = self._py_readinto
+
+        self.connect = self._connect
+        self.close = self._close
+
+    async def _mp_write(self, buf):
+        return self._sock.write(buf)
+
+    async def _a_write(self, buf):
+        return await self._sock.a_write(buf)
+
+    async def _py_write(self, buf):
+        return self._sock.send(buf)
+
+    async def _connect(self, address):
+        if self._async_sock:
+            return await self._sock.a_connect(address)
+        else:
+            return self._sock.connect(address)
+
+    async def getaddrinfo(self, server: str, port: int):
+        if self._async_sock:
+            addr = await self._sock_cls.a_getaddrinfo(server, port)
+        else:
+            addr = self._sock_cls.getaddrinfo(server, port)
+
+        return addr
+
+    async def _close(self):
+        if self._async_sock:
+            return await self._sock.a_close()
+        else:
+            return self._sock.close()
+
+    async def _mp_read(self, n_bytes: int):
+        return self._sock.read(n_bytes)
+
+    async def _py_read(self, n_bytes: int):
+        self._sock.setblocking(True)
+        return self._sock.recv(n_bytes)
+
+    async def _a_read(self, n_bytes: int):
+        return await self._sock.a_read(n_bytes)
+
+    async def _mp_readinto(self, buf, sz):
+        self._sock.readinto(buf, sz)
+
+    async def _py_readinto(self, buf, sz):
+        self._sock.recv_into(buf, sz)
+
+    async def _a_readinto(self, buf, sz):
+        await self._sock.a_readinto(buf, sz)
+
+
 class AsyncMQTTClient:
 
-    def __init__(self, config, recv_buf):
+    def __init__(self, config, recv_buf, sock_cls, async_sock: bool):
         self.client_id = config["client_id"]
-        self.sock = None
+
+        self.sock = sock_cls.socket()
+        self._wrapped = WrappedSocket(self.sock, sock_cls, async_sock)
+
         self.config = config
         self._pid = 0
         self._pid_gen = self._gen_pid()
-        self._a_sock = False
-        self._temp_buf = bytearray(len(recv_buf) * 2)
-        self._recv_buf = recv_buf
+        self._a_sock = async_sock
+        self._recv_buf = memoryview(recv_buf)
         self._meta = memoryview(bytearray(2))
         self._msg_recv = False
 
@@ -58,42 +122,29 @@ class AsyncMQTTClient:
             yield pid
 
     async def _send_str(self, s):
-        if self._a_sock:
-            await self.sock.a_write(struct.pack("!H", len(s)))
-            await self.sock.a_write(s)
-        else:
-            self.sock.write(struct.pack("!H", len(s)))
-            self.sock.write(s)
+        await self._wrapped.write(struct.pack("!H", len(s)))
+        await self._wrapped.write(s)
 
     async def _recv_len(self):
         n = 0
         sh = 0
         while 1:
-            b = await self.sock.a_read(1)[0] if self._a_sock else self.sock.read(1)[0]
+            b = (await self._wrapped.read(1))[0]
             n |= (b & 0x7F) << sh
             if not b & 0x80:
                 return n
             sh += 7
 
     # noinspection PyUnresolvedReferences
-    async def connect(self, clean_session=True, sock_cls=None, async_sock=False):
-        if async_sock:
-            self._a_sock = True
-        if not sock_cls:
-            import socket
-            sock_cls = socket
+    async def connect(self, clean_session=True, ):
+        addr = (await self._wrapped.getaddrinfo(self.config['server'], self.config['port']))[0][-1]
 
-        self.sock = sock_cls.socket()
-        if self._a_sock:
-            addr = await sock_cls.a_getaddrinfo(self.config['server'], self.config['port'])[0][-1]
-        else:
-            addr = sock_cls.getaddrinfo(self.config['server'], self.config['port'])[0][-1]
-
-        await self.sock.a_connect(addr) if self._a_sock else self.sock.connect(addr)
+        await self._wrapped.connect(addr)
 
         if self.config['port'] == 8883:
             import ssl
             self.sock = ssl.wrap_socket(self.sock)
+            self._wrapped.sock = self.sock
         premsg = bytearray(b"\x10\0\0\0\0\0")
         msg = bytearray(b"\x04MQTT\x04\x02\0\0")
 
@@ -117,9 +168,9 @@ class AsyncMQTTClient:
             sz >>= 7
             i += 1
         premsg[i] = sz
-        # if self._a_sock:
-        await self.sock.a_write(premsg[:i + 2]) if self._a_sock else self.sock.write(premsg[:i + 2])
-        await self.sock.a_write(msg) if self._a_sock else self.sock.write(msg)
+
+        await self._wrapped.write(premsg[:i + 2])
+        await self._wrapped.write(msg)
         await self._send_str(self.client_id)
 
         if self.config["last_will"]["topic"]:
@@ -129,51 +180,64 @@ class AsyncMQTTClient:
             await self._send_str(self.config['user'])
             await self._send_str(self.config['password'])
 
-        resp = await self.sock.a_read(4) if self._a_sock else self.sock.read(4)
+        resp = await self._wrapped.read(4)
+
         assert resp[0] == 0x20 and resp[1] == 0x02
         print("connected to mqtt")
         return (resp[2] & 1) == 0
 
     async def disconnect(self):
-        await self.sock.a_write(b"\xe0\0") if self._a_sock else self.sock.write(b"\xe0\0")
-        await self.sock.a_close() if self._a_sock else self.sock.close()
+        await self._wrapped.write(b"\xe0\0")
+        await self._wrapped.close()
 
     async def ping(self):
-        await self.sock.a_write(b"\xc0\0") if self._a_sock else self.sock.write(b"\xc0\0")
+        await self._wrapped.write(b"\xc0\0")
 
-    async def publish(self, topic: bytes, msg: bytes, retain=False, qos=0):
-        _m = self._temp_buf
-        _m[0] = 0x30 | (qos << 1 | retain)  # byte 1
+    async def publish(self, topic: bytes, msg: bytes, retain=False, qos=0, raise_exception=True):
+        try:
+            await self._publish(topic, msg, retain, qos, )
+            return True
+        except Exception as e:
+            print(f"MQTT CLIENT: Exception {e} occurred while publishing {msg} to {topic}")
+            if raise_exception:
+                raise e
+            return False
+
+    async def _publish(self, topic: bytes, msg: bytes, retain=False, qos=0):
+        buf = self._recv_buf
+        idx = 0
+        buf[idx] = 0x30 | (qos << 1 | retain)  # byte 1
+        idx += 1
         sz = 2 + len(topic) + len(msg)
         if qos > 0:
             sz += 2
         assert sz < 2097152
-        _m[1] = sz  # byte 2
-        idx = 2
-        struct.pack_into("!H", _m, idx, len(topic))  # byte 3-4 = len(topic)
+        buf[idx] = sz  # byte 2
+        idx += 1
+
+        struct.pack_into("!H", buf, idx, len(topic))  # byte 3-4 = len(topic)
         idx += struct.calcsize("!H")
-        _m[idx:len(topic)] = topic
+        buf[idx:idx + len(topic)] = topic
         idx += len(topic)
         if qos > 0:
             self.next_pid()
-            struct.pack_into("!H", _m, idx, self._pid)
+            struct.pack_into("!H", buf, idx, self._pid)
             idx += struct.calcsize("!H")
-        _m[idx:len(msg)] = msg
+        buf[idx:idx + len(msg)] = msg
         idx += len(msg)
-
-        await self.sock.a_write(memoryview(_m)[:idx]) if self._a_sock else self.sock.write(memoryview(_m)[:idx])
+        await self._wrapped.write(buf[:idx])
 
         if qos == 1:
             while 1:
                 op = await self.wait_msg()
                 if op == 0x40:
-                    sz = await self.sock.a_read(1) if self._a_sock else self.sock.read(1)
+                    sz = await self._wrapped.read(1)
                     assert sz == b"\x02"
-                    rcv_pid = await self.sock.a_read(2) if self._a_sock else self.sock.read(2)
+                    rcv_pid = await self._wrapped.read(2)
                     rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
                     if self._pid == rcv_pid:
                         return
-                await uasyncio.sleep_ms(0)
+                await uasyncio.sleep(0)
         elif qos == 2:
             assert 0
 
@@ -181,29 +245,28 @@ class AsyncMQTTClient:
         pkt = bytearray(b"\x82\0\0\0")
         self.next_pid()
         struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, self._pid)
-        await self.sock.a_write(pkt) if self._a_sock else self.sock.write(pkt)
+        await self._wrapped.write(pkt)
         await self._send_str(topic)
         qos = qos.to_bytes(1, "little")
-        await self.sock.a_write(qos) if self._a_sock else self.sock.write(qos)
+        await self._wrapped.write(qos)
 
         while 1:
             op = await self.wait_msg()
             if op == 0x90:
-                resp = await self.sock.a_read(4) if self._a_sock else self.sock.read(4)
+                resp = await self._wrapped.read(4)
                 assert resp[1] == pkt[2] and resp[2] == pkt[3]
                 return
-            await uasyncio.sleep_ms(0)
+            await uasyncio.sleep(0)
 
     async def wait_msg(self):
-        res = await self.sock.a_read(1) if self._a_sock else self.sock.read(1)
+        res = await self._wrapped.read(1)
         self.sock.setblocking(True)
         if res is None:
             return None
         if res == b"":
             return None
         if res == b"\xd0":  # PING RESP
-            r = await self.sock.a_read(1)[0] if self._a_sock else self.sock.read(1)[0]
-            sz = r[0]
+            sz = (await self._wrapped.read(1))[0]
             assert sz == 0
             return None
 
@@ -213,30 +276,26 @@ class AsyncMQTTClient:
 
         sz = await self._recv_len()
 
-        topic_len = await self.sock.a_read(2) if self._a_sock else self.sock.read(2)
+        topic_len = await self._wrapped.read(2)
         topic_len = (topic_len[0] << 8) | topic_len[1]
 
-        await self.sock.a_readinto(self._recv_buf, topic_len) if self._a_sock else self.sock.readinto(self._recv_buf,
-                                                                                                      topic_len)
+        await self._wrapped.readinto(self._recv_buf, topic_len)
+
         sz -= topic_len + 2
         pid = 0
         if op & 6:
-            pid = await self.sock.a_read(2) if not self._a_sock else self.sock.read(2)
+            pid = await self._wrapped.read(2)
             pid = pid[0] << 8 | pid[1]
             sz -= 2
+        await self._wrapped.readinto(self._recv_buf[topic_len:topic_len + sz], sz)
 
-        memoryview(self._recv_buf)[topic_len:topic_len + sz] = await self.sock.a_read(
-            sz) if self._a_sock else self.sock.read(
-            sz)
-
-        # self.cb(memoryview(self._recv_buf)[:topic_len], memoryview(self._recv_buf)[topic_len:topic_len + sz])
         self._meta[0] = topic_len
         self._meta[1] = topic_len + sz
         self._msg_recv = True
         if op & 6 == 2:
             pkt = bytearray(b"\x40\x02\0\0")
             struct.pack_into("!H", pkt, 2, pid)
-            await self.sock.a_write(pkt) if self._a_sock else self.sock.write(pkt)
+            await self._wrapped.write(pkt)
         return op
 
     async def check_msg(self) -> memoryview | None:
@@ -257,12 +316,12 @@ class AsyncMQTTClient:
     @property
     def msg(self):
         if self._msg_recv:
-            return memoryview(self._recv_buf)[self._meta[0]:self._meta[1]]
+            return self._recv_buf[self._meta[0]:self._meta[1]]
 
     @property
     def topic(self):
         if self._msg_recv:
-            return memoryview(self._recv_buf)[0:self._meta[0]]
+            return self._recv_buf[0:self._meta[0]]
 
 # EXAMPLE CONFIG
 # MQTT_CONFIG = {
